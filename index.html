@@ -151,6 +151,7 @@ pre.code .ln{display:inline-block;width:38px;text-align:right;margin-right:14px;
 .note{font-size:12px;color:var(--ink-3);margin-top:10px}
 </style>
 </head>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <body>
 <div class="wrap" id="app"></div>
 <script>
@@ -170,7 +171,13 @@ const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'
 const shuffle = a => { a = a.slice(); for (let i = a.length-1; i > 0; i--) { const j = Math.floor(Math.random()*(i+1)); [a[i],a[j]] = [a[j],a[i]]; } return a; };
 const pool = () => BANK.filter(q => picked.has(q.s));
 
-/* ---------------- users / session ---------------- */
+/* ---------------- Supabase (shared tests + saved results live here now) ---------------- */
+const SUPABASE_URL = 'https://eldytseqkmvlywlsntpy.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_ecm_kuGVYs07EIYQXEuw3g_S6NFX5uJ';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+let endChannel = null; // realtime subscription for "creator ended this test"
+
+/* ---------------- users / session (kept local: no server round-trip needed to log in) ---------------- */
 const USERS = {
   kanth:     { password: '2103',      name: 'Kanth',     role: 'admin' },
   chatiyana: { password: 'scientist', name: 'Chatiyana', role: 'user'  },
@@ -209,44 +216,69 @@ function decodeKey(key){
 }
 function shortCode(){ return Math.random().toString(36).slice(2, 8).toUpperCase(); }
 
-function saveLaunch(entry){
-  const all = LS.get('cquiz_launched', []);
-  all.push(entry);
-  LS.set('cquiz_launched', all);
+/* ---------------- launched_tests (Supabase) ---------------- */
+async function dbInsertLaunch(row){
+  try { return await sb.from('launched_tests').insert(row).select().single(); }
+  catch (e) { return { error: e }; }
 }
-function findLaunchByCode(code){
-  const all = LS.get('cquiz_launched', []);
-  return all.find(l => l.code === code.trim().toUpperCase());
+async function dbFindLaunchByCode(code){
+  try { const { data } = await sb.from('launched_tests').select('*').eq('code', code.trim().toUpperCase()).maybeSingle(); return data; }
+  catch (e) { return null; }
 }
-function markEnded(fullKey){
-  const all = LS.get('cquiz_launched', []);
-  const rec = all.find(l => l.fullKey === fullKey);
-  if (rec) { rec.ended = true; rec.endedAt = Date.now(); LS.set('cquiz_launched', all); }
-  return rec;
+async function dbFindLaunchByKey(fullKey){
+  try { const { data } = await sb.from('launched_tests').select('*').eq('full_key', fullKey).maybeSingle(); return data; }
+  catch (e) { return null; }
 }
-function isEnded(fullKey){
-  const all = LS.get('cquiz_launched', []);
-  const rec = all.find(l => l.fullKey === fullKey);
-  return rec ? !!rec.ended : false;
+async function dbMarkEnded(fullKey){
+  try { return await sb.from('launched_tests').update({ ended: true, ended_at: new Date().toISOString() }).eq('full_key', fullKey); }
+  catch (e) { return { error: e }; }
+}
+async function dbMyLaunches(username, isAdmin){
+  try {
+    let q = sb.from('launched_tests').select('*').order('created_at', { ascending: false });
+    if (!isAdmin) q = q.eq('creator', username);
+    const { data } = await q;
+    return data || [];
+  } catch (e) { return []; }
 }
 
-/* ---------------- saved results ---------------- */
-function saveResult(rec){
-  const all = LS.get('cquiz_results', []);
-  all.push(rec);
-  LS.set('cquiz_results', all);
+/* ---------------- quiz_results (Supabase) ---------------- */
+async function dbSaveResult(row){
+  try { return await sb.from('quiz_results').insert(row); }
+  catch (e) { return { error: e }; }
 }
-function myResults(){
-  const all = LS.get('cquiz_results', []);
-  if (!session) return [];
-  if (session.role === 'admin') return all.slice().reverse();
-  return all.filter(r => r.username === session.username).reverse();
+async function dbMyResults(username, isAdmin){
+  try {
+    let q = sb.from('quiz_results').select('*').order('created_at', { ascending: false });
+    if (!isAdmin) q = q.eq('username', username);
+    const { data } = await q;
+    return data || [];
+  } catch (e) { return []; }
 }
-function resultsForCreator(username){
-  const all = LS.get('cquiz_results', []);
-  const launched = LS.get('cquiz_launched', []).filter(l => l.creator === username);
-  const keys = new Set(launched.map(l => l.fullKey));
-  return all.filter(r => r.fullKey && keys.has(r.fullKey)).reverse();
+async function dbResultsForKeys(fullKeys){
+  if (!fullKeys.length) return [];
+  try { const { data } = await sb.from('quiz_results').select('*').in('full_key', fullKeys).order('created_at', { ascending: false }); return data || []; }
+  catch (e) { return []; }
+}
+async function dbResultById(id){
+  try { const { data } = await sb.from('quiz_results').select('*').eq('id', id).maybeSingle(); return data; }
+  catch (e) { return null; }
+}
+
+/* ---------------- realtime: creator ending an exam pushes to every device ---------------- */
+function subscribeToEndEvents(fullKey){
+  if (endChannel) { sb.removeChannel(endChannel); endChannel = null; }
+  endChannel = sb.channel('end-' + fullKey)
+    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'launched_tests', filter: `full_key=eq.${fullKey}` }, payload => {
+      if (payload.new.ended && S && S.share && S.share.fullKey === fullKey && !S.done) {
+        S.share.ended = true;
+        screenQuestion();
+      }
+    })
+    .subscribe();
+}
+function unsubscribeEndEvents(){
+  if (endChannel) { sb.removeChannel(endChannel); endChannel = null; }
 }
 const fmtTime = s => String(Math.floor(s/60)).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
 const secName = q => (q ? secLabel(q.s) : '');
@@ -283,7 +315,7 @@ function screenLogin(loginErr){
       <button class="btn primary" type="submit" style="width:100%">Log in</button>
     </form>
   </div>
-  <p class="footer">cquiz &middot; local sign-in, no data leaves this browser</p>`;
+  <p class="footer">cquiz &middot; sign-in stays on this device &middot; shared tests and results sync via Supabase</p>`;
   root.querySelector('#u').focus();
 }
 
@@ -306,6 +338,7 @@ function doLogout(){
 /* ---------------- setup ---------------- */
 function screenSetup(){
   if (!session) { screenLogin(); return; }
+  unsubscribeEndEvents();
   if (S && S.timer) clearInterval(S.timer);
   S = null;
   const counts = SECTIONS.map((_, i) => BANK.filter(q => q.s === i).length);
@@ -353,7 +386,7 @@ function screenSetup(){
     </div>
     <div class="share-block">
       <h3 style="font-size:14px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);margin-bottom:10px">Launch a shared test</h3>
-      <p class="tiny">Uses the topics and question count picked above. Anyone who enters the key gets the exact same questions in the exact same order &mdash; great for a class test. You can end it any time; that mark saves alongside everyone's results in this browser.</p>
+      <p class="tiny">Uses the topics and question count picked above. Anyone who enters the key on any device gets the exact same questions in the exact same order &mdash; great for a class test. Ending it stops new joins immediately, everywhere, and stops anyone currently taking it too.</p>
       <div class="share-row" style="margin-top:10px">
         <button class="btn" data-act="launch" ${n ? '' : 'disabled'}>Launch shared test</button>
       </div>
@@ -370,6 +403,7 @@ function screenSetup(){
 
 /* ---------------- test ---------------- */
 function startTest(list, share){
+  unsubscribeEndEvents();
   const qs = (Array.isArray(list) && list.length)
     ? list
     : shuffle(pool()).slice(0, size).map(q => ({...q, opts: shuffle(q.o)}));
@@ -385,46 +419,66 @@ function startTest(list, share){
   screenQuestion();
 }
 
-function launchSharedTest(){
+async function launchSharedTest(){
   if (!session) { screenLogin(); return; }
   const topics = Array.from(picked);
   const n = Math.min(size, pool().length);
   if (!n) return;
+  const btn = root.querySelector('[data-act="launch"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Launching…'; }
   const seed = Math.floor(Math.random() * 1e9);
-  const payload = { t: topics, n, sd: seed, cr: session.username, crName: session.name, ts: Date.now() };
-  const fullKey = encodeKey(payload);
-  let code;
-  do { code = shortCode(); } while (findLaunchByCode(code));
-  saveLaunch({ code, fullKey, creator: session.username, creatorName: session.name, topics, size: n, seed, createdAt: payload.ts, ended: false });
+  const code = shortCode();
+  const fullKey = encodeKey({ t: topics, n, sd: seed, cr: session.username, crName: session.name, ts: Date.now() });
+  const { error } = await dbInsertLaunch({
+    code, full_key: fullKey, creator: session.username, creator_name: session.name,
+    topics, size: n, seed
+  });
+  if (error) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Launch shared test'; }
+    window.alert('Could not launch the shared test: ' + error.message);
+    return;
+  }
   const qs = buildSeededQuestions(topics, n, seed);
   startTest(qs, { fullKey, code, creator: session.username, creatorName: session.name, isCreator: true, ended: false });
+  subscribeToEndEvents(fullKey);
   window.scrollTo(0, 0);
 }
 
-function joinSharedTest(raw){
+async function joinSharedTest(raw){
   const errEl = root.querySelector('#joinErr');
   const input = (raw || '').trim();
   if (!input) { if (errEl) errEl.textContent = 'Enter a code or key first.'; return; }
+  if (errEl) errEl.textContent = 'Looking for that test…';
   let rec = null, payload = null;
-  if (/^[A-Z0-9]{4,8}$/i.test(input)) rec = findLaunchByCode(input);
-  if (rec) { payload = { t: rec.topics, n: rec.size, sd: rec.seed, cr: rec.creator, crName: rec.creatorName, ts: rec.createdAt }; }
+  if (/^[A-Z0-9]{4,8}$/i.test(input)) rec = await dbFindLaunchByCode(input);
+  if (rec) { payload = { t: rec.topics, n: rec.size, sd: rec.seed, cr: rec.creator, crName: rec.creator_name }; }
   else { payload = decodeKey(input); }
   if (!payload || !Array.isArray(payload.t) || !payload.n) {
     if (errEl) errEl.textContent = "That code or key isn't valid.";
     return;
   }
-  const fullKey = encodeKey(payload);
-  if (isEnded(fullKey)) { if (errEl) errEl.textContent = 'This test was already ended by its creator.'; return; }
+  const fullKey = rec ? rec.full_key : input.trim();
+  if (!rec) rec = await dbFindLaunchByKey(fullKey);
+  if (rec && rec.ended) { if (errEl) errEl.textContent = 'This test was already ended by its creator.'; return; }
   const qs = buildSeededQuestions(payload.t, payload.n, payload.sd);
   if (!qs.length) { if (errEl) errEl.textContent = 'No matching questions found for that key.'; return; }
-  const isCreator = session && session.username === payload.cr;
-  startTest(qs, { fullKey, code: rec ? rec.code : null, creator: payload.cr, creatorName: payload.crName, isCreator, ended: false });
+  const isCreator = session && session.username === (rec ? rec.creator : payload.cr);
+  startTest(qs, {
+    fullKey,
+    code: rec ? rec.code : null,
+    creator: rec ? rec.creator : payload.cr,
+    creatorName: rec ? rec.creator_name : payload.crName,
+    isCreator, ended: false
+  });
+  subscribeToEndEvents(fullKey);
+  if (errEl) errEl.textContent = '';
   window.scrollTo(0, 0);
 }
 
-function endSharedTest(){
+async function endSharedTest(){
   if (!S || !S.share || !S.share.isCreator) return;
-  markEnded(S.share.fullKey);
+  const { error } = await dbMarkEnded(S.share.fullKey);
+  if (error) { window.alert('Could not end the test: ' + error.message); return; }
   S.share.ended = true;
   screenQuestion();
 }
@@ -495,20 +549,20 @@ function screenResult(){
 
   if (!S.saved && session) {
     S.saved = true;
-    saveResult({
-      id: Date.now() + '-' + Math.random().toString(36).slice(2, 8),
-      username: session.username, name: session.name,
-      fullKey: S.share ? S.share.fullKey : null,
+    unsubscribeEndEvents();
+    dbSaveResult({
+      full_key: S.share ? S.share.fullKey : null,
       code: S.share ? S.share.code : null,
       creator: S.share ? S.share.creator : null,
-      creatorName: S.share ? S.share.creatorName : null,
+      creator_name: S.share ? S.share.creatorName : null,
+      username: session.username, name: session.name,
       topics: [...new Set(qs.map(q => q.s))].map(secLabel),
-      size: qs.length, right, wrong, skipped, pct, secs: S.secs, timestamp: Date.now(),
+      size: qs.length, correct_count: right, wrong_count: wrong, skipped_count: skipped, pct, secs: S.secs,
       review: qs.map((q, i) => ({ s: q.s, p: q.p, c: q.c, opts: q.opts, a: q.a, given: given[i] }))
-    });
+    }).then(({ error }) => { if (error) console.error('Could not save result:', error.message); });
   }
   const shareNote = S.share
-    ? `<p class="tiny" style="padding:0 32px 16px">${S.share.isCreator ? 'As the creator, you' : 'You'} can see every saved attempt for this test from <a data-act="dashboard" style="color:var(--accent)">the dashboard</a> on this device.</p>`
+    ? `<p class="tiny" style="padding:0 32px 16px">${S.share.isCreator ? 'As the creator, you' : 'You'} can see every saved attempt for this test from <a data-act="dashboard" style="color:var(--accent)">the dashboard</a>.</p>`
     : '';
 
   root.innerHTML = `
@@ -593,62 +647,68 @@ function screenAttemptReview(rec){
       <span class="eyebrow">${esc(rec.name)}'s attempt${rec.code ? ' &middot; test ' + esc(rec.code) : ''}</span>
       <div class="bigscore">${rec.pct}<small>%</small></div>
       <div class="tally">
-        <div class="t-ok"><b>${rec.right}</b>correct</div>
-        <div class="t-bad"><b>${rec.wrong}</b>wrong</div>
-        <div class="t-skip"><b>${rec.skipped}</b>skipped</div>
+        <div class="t-ok"><b>${rec.correct_count}</b>correct</div>
+        <div class="t-bad"><b>${rec.wrong_count}</b>wrong</div>
+        <div class="t-skip"><b>${rec.skipped_count}</b>skipped</div>
         <div><b>${fmtTime(rec.secs)}</b>time</div>
       </div>
     </div>
     <div class="breakdown">
       <span class="eyebrow">Topics covered</span>
       <p class="tiny" style="margin-top:8px">${rec.topics.map(esc).join(', ')}</p>
-      <p class="tiny">${new Date(rec.timestamp).toLocaleString()}</p>
+      <p class="tiny">${new Date(rec.created_at).toLocaleString()}</p>
     </div>
   </div>
   <div class="review-tools"><span class="eyebrow">Review</span></div>
   <div class="review">${rec.review.map((r, i) => savedRevCard(r, i)).join('')}</div>`;
 }
 
-function screenMyResults(){
+async function screenMyResults(){
   if (!session) { screenLogin(); return; }
-  const results = myResults();
+  root.innerHTML = `
+  <div class="topbar-user"><button class="btn ghost" data-act="back" style="padding:6px 12px;font-size:12.5px">&larr; Back</button></div>
+  <div class="sheet"><div class="hero" style="padding:28px 32px"><p class="lede">Loading&hellip;</p></div></div>`;
+  const results = await dbMyResults(session.username, session.role === 'admin');
   root.innerHTML = `
   <div class="topbar-user"><button class="btn ghost" data-act="back" style="padding:6px 12px;font-size:12.5px">&larr; Back</button></div>
   <div class="sheet">
     <div class="hero" style="padding:28px 32px 18px">
       <div class="brand"><h1 style="font-size:28px">${session.role === 'admin' ? 'All results' : 'My results'}</h1></div>
-      <p class="lede">${results.length ? results.length + ' attempt(s) saved in this browser.' : 'No attempts saved on this device yet.'}</p>
+      <p class="lede">${results.length ? results.length + ' attempt(s) saved.' : 'No attempts saved yet &mdash; take a test first.'}</p>
     </div>
     ${results.map(r => `<div class="dash-row">
-        <div><span class="nm">${esc(r.name)}</span> <span class="muted">${new Date(r.timestamp).toLocaleString()}</span>${r.code ? ' <span class="pill">' + esc(r.code) + '</span>' : ''}</div>
-        <div class="sc">${r.right}/${r.size} &middot; ${r.pct}% &middot; <button class="linkbtn" data-act="viewresult" data-id="${esc(r.id)}">Review</button></div>
-      </div>`).join('') || '<div class="dash-row"><span class="muted">Nothing here yet &mdash; take a test first.</span></div>'}
+        <div><span class="nm">${esc(r.name)}</span> <span class="muted">${new Date(r.created_at).toLocaleString()}</span>${r.code ? ' <span class="pill">' + esc(r.code) + '</span>' : ''}</div>
+        <div class="sc">${r.correct_count}/${r.size} &middot; ${r.pct}% &middot; <button class="linkbtn" data-act="viewresult" data-id="${esc(r.id)}">Review</button></div>
+      </div>`).join('') || '<div class="dash-row"><span class="muted">Nothing here yet.</span></div>'}
   </div>`;
 }
 
-function screenDashboard(){
+async function screenDashboard(){
   if (!session) { screenLogin(); return; }
-  const launched = LS.get('cquiz_launched', []);
-  const mine = session.role === 'admin' ? launched : launched.filter(l => l.creator === session.username);
-  const allResults = LS.get('cquiz_results', []);
+  root.innerHTML = `
+  <div class="topbar-user"><button class="btn ghost" data-act="back" style="padding:6px 12px;font-size:12.5px">&larr; Back</button></div>
+  <div class="sheet"><div class="hero" style="padding:28px 32px"><p class="lede">Loading&hellip;</p></div></div>`;
+  const isAdmin = session.role === 'admin';
+  const mine = await dbMyLaunches(session.username, isAdmin);
+  const attempts = await dbResultsForKeys(mine.map(l => l.full_key));
   root.innerHTML = `
   <div class="topbar-user"><button class="btn ghost" data-act="back" style="padding:6px 12px;font-size:12.5px">&larr; Back</button></div>
   <div class="sheet">
     <div class="hero" style="padding:28px 32px 18px">
-      <div class="brand"><h1 style="font-size:28px">${session.role === 'admin' ? 'Admin dashboard' : 'My launched tests'}</h1></div>
-      <p class="lede">${session.role === 'admin' ? 'Every shared test and attempt saved in this browser.' : 'Tests you launched, and who has attempted them, saved in this browser.'}</p>
+      <div class="brand"><h1 style="font-size:28px">${isAdmin ? 'Admin dashboard' : 'My launched tests'}</h1></div>
+      <p class="lede">${isAdmin ? 'Every shared test and every attempt, anywhere it was taken.' : 'Tests you launched, and who has attempted them so far.'}</p>
     </div>
     ${mine.map(l => {
-      const attempts = allResults.filter(r => r.fullKey === l.fullKey);
+      const theseAttempts = attempts.filter(r => r.full_key === l.full_key);
       return `<div style="border-top:1px solid var(--rule)">
         <div class="dash-row" style="background:#F7F9FA">
-          <div><span class="pill">${esc(l.code)}</span> <span class="nm">${esc(l.creatorName || l.creator)}</span>
+          <div><span class="pill">${esc(l.code)}</span> <span class="nm">${esc(l.creator_name || l.creator)}</span>
             <span class="muted">${esc(l.topics.map(secLabel).join(', '))}</span></div>
-          <div class="sc">${l.ended ? '<span style="color:var(--bad)">ended</span>' : '<span style="color:var(--ok)">live</span>'} &middot; ${attempts.length} attempt(s)</div>
+          <div class="sc">${l.ended ? '<span style="color:var(--bad)">ended</span>' : '<span style="color:var(--ok)">live</span>'} &middot; ${theseAttempts.length} attempt(s)</div>
         </div>
-        ${attempts.map(r => `<div class="dash-row">
+        ${theseAttempts.map(r => `<div class="dash-row">
             <div class="nm">${esc(r.name)}</div>
-            <div class="sc">${r.right}/${r.size} &middot; ${r.pct}% &middot; <button class="linkbtn" data-act="viewresult" data-id="${esc(r.id)}">Review</button></div>
+            <div class="sc">${r.correct_count}/${r.size} &middot; ${r.pct}% &middot; <button class="linkbtn" data-act="viewresult" data-id="${esc(r.id)}">Review</button></div>
           </div>`).join('') || '<div class="dash-row"><span class="muted">No attempts yet.</span></div>'}
       </div>`;
     }).join('') || '<div class="dash-row"><span class="muted">You have not launched a shared test yet.</span></div>'}
@@ -665,7 +725,7 @@ function answer(i){
   screenQuestion();
 }
 
-root.addEventListener('click', function(e){
+root.addEventListener('click', async function(e){
   const el = e.target.closest('[data-act]');
   if (!el || el.disabled) return;
   const act = el.dataset.act;
@@ -701,15 +761,16 @@ root.addEventListener('click', function(e){
   }
   else if (act === 'new') { screenSetup(); window.scrollTo(0, 0); }
   else if (act === 'logout') { doLogout(); }
-  else if (act === 'launch') { launchSharedTest(); }
-  else if (act === 'join') { joinSharedTest(root.querySelector('#joinKey') && root.querySelector('#joinKey').value); }
-  else if (act === 'endtest') { if (window.confirm('End this shared test for future joiners? Already-saved attempts stay on record.')) endSharedTest(); }
-  else if (act === 'results') { navBack = () => screenSetup(); listScreen = () => screenMyResults(); screenMyResults(); window.scrollTo(0, 0); }
-  else if (act === 'dashboard') { navBack = () => screenSetup(); listScreen = () => screenDashboard(); screenDashboard(); window.scrollTo(0, 0); }
+  else if (act === 'launch') { await launchSharedTest(); }
+  else if (act === 'join') { await joinSharedTest(root.querySelector('#joinKey') && root.querySelector('#joinKey').value); }
+  else if (act === 'endtest') { if (window.confirm('End this shared test for future joiners? Already-saved attempts stay on record.')) await endSharedTest(); }
+  else if (act === 'results') { navBack = () => screenSetup(); listScreen = () => screenMyResults(); await screenMyResults(); window.scrollTo(0, 0); }
+  else if (act === 'dashboard') { navBack = () => screenSetup(); listScreen = () => screenDashboard(); await screenDashboard(); window.scrollTo(0, 0); }
   else if (act === 'viewresult') {
     const id = el.dataset.id;
-    const rec = LS.get('cquiz_results', []).find(r => r.id === id);
     navBack = listScreen;
+    root.innerHTML = '<div class="sheet"><div class="hero" style="padding:28px 32px"><p class="lede">Loading&hellip;</p></div></div>';
+    const rec = await dbResultById(id);
     screenAttemptReview(rec);
     window.scrollTo(0, 0);
   }
